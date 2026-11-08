@@ -848,6 +848,47 @@ it.live("streams to a read-only viewer without allowing takeover, input, or view
   ).pipe(Effect.provide(layer)),
 );
 
+it.live("shows a viewer a native popup its screencast leaves out until the popup closes", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const { browser, tabId } = yield* ready;
+      const viewer = yield* browser.attachViewer(viewerInput(tabId, true));
+      yield* viewer.input({ type: "takeControl" });
+      const session = contexts[0]!.sessions.at(-1)!;
+      const send = session.send.getMockImplementation()!;
+      let popupOpen = false;
+      session.send.mockImplementation(async (method, input) =>
+        method === "Runtime.evaluate" &&
+        String((input as { expression?: string }).expression).includes(":open")
+          ? { result: { value: popupOpen } }
+          : send(method, input),
+      );
+      const nextFrame = Effect.gen(function* () {
+        for (;;) {
+          const item = yield* Queue.take(viewer.output);
+          if (item._tag === "frame") return item.data.toString();
+        }
+      });
+      const screencast = (data: string) =>
+        session.emit("Page.screencastFrame", {
+          data: Buffer.from(data).toString("base64"),
+          sessionId: 1,
+        });
+      expect(yield* nextFrame).toBe("frame");
+
+      popupOpen = true;
+      yield* viewer.input({ type: "mouse", action: "down", x: 10, y: 10, button: "left" });
+      screencast("without popup");
+      expect(yield* nextFrame).toBe("frame");
+      popupOpen = false;
+      yield* viewer.input({ type: "key", action: "down", key: "Escape", code: "Escape" });
+      expect(yield* nextFrame).toBe("frame");
+      screencast("live");
+      expect(yield* nextFrame).toBe("live");
+    }),
+  ).pipe(Effect.provide(layer)),
+);
+
 it.live(
   "takeover waits for the running agent and revokes snapshot refs before returning control",
   () =>

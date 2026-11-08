@@ -95,6 +95,15 @@ const SCREENCAST_SETTLE_MS = 200;
 const SCREENCAST_MOTION_FRAMES = 4;
 const SCREENCAST_MOTION_WINDOW_MS = 300;
 const SCREENCAST_MOTION_QUALITY = 50;
+// Screencasts leave out native popups such as a <select> menu; screenshots include them.
+const POPUP_OPEN_SCRIPT = `(() => {
+  let element = document.activeElement;
+  for (;;) {
+    const inner = element?.shadowRoot?.activeElement ?? element?.contentDocument?.activeElement;
+    if (!inner) return element?.matches("select:open, input:open") ?? false;
+    element = inner;
+  }
+})()`;
 const HOST_RECONNECT_DELAY = "1 second";
 const DESKTOP_ATTACH_TIMEOUT = "10 seconds";
 const VIEWER_OUTPUT_LIMIT = 64;
@@ -2632,9 +2641,29 @@ const make = Effect.gen(function* () {
         if (settleTimer !== null) clearTimeout(settleTimer);
       }),
     );
+    let popupOpen = false;
+    const syncPopup = async (redraw: boolean) => {
+      const open = await session
+        .send("Runtime.evaluate", { expression: POPUP_OPEN_SCRIPT, returnByValue: true })
+        .then(
+          (result) => result.result.value === true,
+          () => false,
+        );
+      if (open === popupOpen && !(open && redraw)) return;
+      popupOpen = open;
+      await pushStill();
+    };
     let screencastStarted = false;
     session.on("Page.screencastFrame", (frame) => {
       screencastStarted = true;
+      if (popupOpen) {
+        // A still's own repaint lands here too, so only a closed popup redraws.
+        void session
+          .send("Page.screencastFrameAck", { sessionId: frame.sessionId })
+          .catch(constVoid);
+        void syncPopup(false);
+        return;
+      }
       if (framesInFlight > 0) mayHaveDropped = true;
       framesInFlight += 1;
       const arrivedAt = Date.now();
@@ -2682,6 +2711,7 @@ const make = Effect.gen(function* () {
     // An idle page does not repaint for a new screencast, so the viewer
     // starts from a still unless a live frame beat it.
     if (!screencastStarted) yield* Effect.promise(pushStill);
+    yield* Effect.promise(() => syncPopup(false));
     return {
       output,
       input: (raw: unknown) =>
@@ -2740,8 +2770,10 @@ const make = Effect.gen(function* () {
                     deltaY: num(waiting.deltaY) + num(next.deltaY),
                   }),
                 );
+                await syncPopup(true);
               } else {
                 await tab.control.human(viewer.id, () => dispatch(message));
+                await syncPopup(true);
               }
             }
           } catch {
